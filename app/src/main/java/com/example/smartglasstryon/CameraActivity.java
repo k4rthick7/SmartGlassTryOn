@@ -2,11 +2,10 @@ package com.example.smartglasstryon;
 
 import android.Manifest;
 import android.content.pm.PackageManager;
+import android.graphics.PointF;
 import android.media.Image;
 import android.os.Bundle;
 import android.util.Log;
-import android.widget.Toast;
-
 import androidx.annotation.NonNull;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.camera.core.CameraSelector;
@@ -17,7 +16,6 @@ import androidx.camera.lifecycle.ProcessCameraProvider;
 import androidx.camera.view.PreviewView;
 import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
-
 import com.google.common.util.concurrent.ListenableFuture;
 import com.google.mlkit.vision.common.InputImage;
 import com.google.mlkit.vision.face.Face;
@@ -25,19 +23,20 @@ import com.google.mlkit.vision.face.FaceDetection;
 import com.google.mlkit.vision.face.FaceDetector;
 import com.google.mlkit.vision.face.FaceDetectorOptions;
 import com.google.mlkit.vision.face.FaceLandmark;
-
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 public class CameraActivity extends AppCompatActivity {
 
     private static final int PERMISSION_REQUEST_CODE = 10;
-    private static final String TAG = "FaceDetector";
-
     private PreviewView previewView;
+    private GlassOverlayView glassOverlay;
     private ListenableFuture<ProcessCameraProvider> cameraProviderFuture;
-
-    // The AI Detector
     private FaceDetector faceDetector;
+
+    // NEW: Background Executor to stop the Lag
+    private ExecutorService cameraExecutor;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -45,21 +44,25 @@ public class CameraActivity extends AppCompatActivity {
         setContentView(R.layout.activity_camera);
 
         previewView = findViewById(R.id.viewFinder);
+        glassOverlay = findViewById(R.id.glassOverlay);
 
-        // Configure ML Kit
+        // Initialize the background thread
+        cameraExecutor = Executors.newSingleThreadExecutor();
+
         FaceDetectorOptions options = new FaceDetectorOptions.Builder()
                 .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST)
-                .setLandmarkMode(FaceDetectorOptions.LANDMARK_MODE_ALL) // We need eyes!
+                .setLandmarkMode(FaceDetectorOptions.LANDMARK_MODE_ALL)
                 .setClassificationMode(FaceDetectorOptions.CLASSIFICATION_MODE_NONE)
                 .build();
 
         faceDetector = FaceDetection.getClient(options);
 
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
+                == PackageManager.PERMISSION_GRANTED) {
             startCamera();
         } else {
             ActivityCompat.requestPermissions(this,
-                    new String[] { Manifest.permission.CAMERA },
+                    new String[]{Manifest.permission.CAMERA},
                     PERMISSION_REQUEST_CODE);
         }
     }
@@ -71,36 +74,31 @@ public class CameraActivity extends AppCompatActivity {
                 ProcessCameraProvider cameraProvider = cameraProviderFuture.get();
                 bindPreview(cameraProvider);
             } catch (ExecutionException | InterruptedException e) {
-                Log.e(TAG, "Error starting camera", e);
+                Log.e("Camera", "Error", e);
             }
         }, ContextCompat.getMainExecutor(this));
     }
 
     private void bindPreview(@NonNull ProcessCameraProvider cameraProvider) {
-        // 1. Preview
         Preview preview = new Preview.Builder().build();
         preview.setSurfaceProvider(previewView.getSurfaceProvider());
 
-        // 2. Camera Selector
         CameraSelector cameraSelector = new CameraSelector.Builder()
                 .requireLensFacing(CameraSelector.LENS_FACING_FRONT)
                 .build();
 
-        // 3. Image Analysis (The AI part)
         ImageAnalysis imageAnalysis = new ImageAnalysis.Builder()
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .build();
 
-        imageAnalysis.setAnalyzer(ContextCompat.getMainExecutor(this), imageProxy -> {
-            processImageProxy(imageProxy);
-        });
+        // FIX: Use 'cameraExecutor' here, NOT MainExecutor
+        imageAnalysis.setAnalyzer(cameraExecutor, this::processImageProxy);
 
         try {
             cameraProvider.unbindAll();
-            // Bind all 3 things: Lifecycle, Camera, Preview, AND ImageAnalysis
             cameraProvider.bindToLifecycle(this, cameraSelector, preview, imageAnalysis);
         } catch (Exception e) {
-            Log.e(TAG, "Use case binding failed", e);
+            Log.e("Camera", "Binding failed", e);
         }
     }
 
@@ -112,44 +110,41 @@ public class CameraActivity extends AppCompatActivity {
 
             faceDetector.process(image)
                     .addOnSuccessListener(faces -> {
-                        for (Face face : faces) {
-                            // If we find a face, look for eyes
+                        if (!faces.isEmpty()) {
+                            Face face = faces.get(0);
                             if (face.getLandmark(FaceLandmark.LEFT_EYE) != null &&
                                     face.getLandmark(FaceLandmark.RIGHT_EYE) != null) {
 
-                                float leftEyeX = face.getLandmark(FaceLandmark.LEFT_EYE).getPosition().x;
-                                float leftEyeY = face.getLandmark(FaceLandmark.LEFT_EYE).getPosition().y;
-                                float rightEyeX = face.getLandmark(FaceLandmark.RIGHT_EYE).getPosition().x;
-                                float rightEyeY = face.getLandmark(FaceLandmark.RIGHT_EYE).getPosition().y;
+                                PointF left = face.getLandmark(FaceLandmark.LEFT_EYE).getPosition();
+                                PointF right = face.getLandmark(FaceLandmark.RIGHT_EYE).getPosition();
 
-                                // LOGGING THE COORDINATES
-                                Log.d(TAG, "EYES FOUND! Left: " + leftEyeX + ", " + leftEyeY +
-                                        " | Right: " + rightEyeX + ", " + rightEyeY);
-
-                                // Log bounding box dimensions
-                                Log.d(TAG, "Bounding Box: Width=" + face.getBoundingBox().width() +
-                                        ", Height=" + face.getBoundingBox().height());
+                                // FIX: Switch back to UI thread to draw
+                                runOnUiThread(() -> {
+                                    glassOverlay.setLandmarks(left.x, left.y, right.x, right.y,
+                                            mediaImage.getWidth(), mediaImage.getHeight());
+                                });
                             }
                         }
                     })
-                    .addOnFailureListener(e -> Log.e(TAG, "Face detection failed", e))
-                    .addOnCompleteListener(task -> imageProxy.close()); // MUST CLOSE IMAGE!
+                    .addOnCompleteListener(task -> imageProxy.close());
         } else {
             imageProxy.close();
         }
     }
 
     @Override
-    public void onRequestPermissionsResult(int requestCode, @NonNull String[] permissions,
-                                           @NonNull int[] grantResults) {
+    protected void onDestroy() {
+        super.onDestroy();
+        if (cameraExecutor != null) {
+            cameraExecutor.shutdown();
+        }
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, @NonNull String[] permissions, @NonNull int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
         if (requestCode == PERMISSION_REQUEST_CODE) {
-            if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-                startCamera();
-            } else {
-                Toast.makeText(this, "Permission required", Toast.LENGTH_SHORT).show();
-                finish();
-            }
+            startCamera();
         }
     }
 }
